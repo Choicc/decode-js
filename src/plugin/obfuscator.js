@@ -7,27 +7,28 @@ const { parse } = require('@babel/parser')
 const generator = require('@babel/generator').default
 const traverse = require('@babel/traverse').default
 const t = require('@babel/types')
-const vm = require('vm')
-const { VM } = require('vm2')
+const ivm = require('isolated-vm')
+const PluginEval = require('./eval.js')
 
-let globalContext = vm.createContext()
-let vm2 = new VM({
-  allowAsync: false,
-  sandbox: globalContext,
-})
+const isolate = new ivm.Isolate()
+const globalContext = isolate.createContextSync()
 function virtualGlobalEval(jsStr) {
-  return vm2.run(String(jsStr))
+  return globalContext.evalSync(String(jsStr))
 }
 
+/**
+ * Extract the literal value of an object, and remove an object if all
+ * references to the object are replaced.
+ */
 function decodeObject(ast) {
-  let obj_node = {}
   function collectObject(path) {
     const id = path.node.id
     const init = path.node.init
     if (!t.isIdentifier(id) || !t.isObjectExpression(init)) {
       return
     }
-    const name = id.name
+    const obj_name = id.name
+    const bind = path.scope.getBinding(obj_name)
     let valid = true
     let count = 0
     let obj = {}
@@ -46,50 +47,32 @@ function decodeObject(ast) {
     if (!valid || !count) {
       return
     }
-    obj_node[name] = obj
+    let safe = true
+    for (let ref of bind.referencePaths) {
+      const parent = ref.parentPath
+      if (ref.key !== 'object' || !parent.isMemberExpression()) {
+        safe = false
+        continue
+      }
+      const key = parent.node.property
+      if (!t.isIdentifier(key) || parent.node.computed) {
+        safe = false
+        continue
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, key.name)) {
+        parent.replaceWith(obj[key.name])
+      } else {
+        safe = false
+      }
+    }
+    bind.scope.crawl()
+    if (safe) {
+      path.remove()
+      console.log(`删除对象: ${obj_name}`)
+    }
   }
   traverse(ast, {
     VariableDeclarator: collectObject,
-  })
-  let obj_used = {}
-  function replaceObject(path) {
-    const name = path.node.object
-    const key = path.node.property
-    if (!t.isIdentifier(name) || !t.isIdentifier(key)) {
-      return
-    }
-    if (!Object.prototype.hasOwnProperty.call(obj_node, name.name)) {
-      return
-    }
-    if (t.isIdentifier(key) && path.node.computed) {
-      // In this case, the identifier points to another value
-      return
-    }
-    path.replaceWith(obj_node[name.name][key.name])
-    obj_used[name.name] = true
-  }
-  traverse(ast, {
-    MemberExpression: replaceObject,
-  })
-  function deleteObject(path) {
-    const id = path.node.id
-    const init = path.node.init
-    if (!t.isIdentifier(id) || !t.isObjectExpression(init)) {
-      return
-    }
-    const name = id.name
-    if (!Object.prototype.hasOwnProperty.call(obj_node, name)) {
-      return
-    }
-    path.remove()
-    let used = 'false'
-    if (Object.prototype.hasOwnProperty.call(obj_used, name)) {
-      used = 'true'
-    }
-    console.log(`删除对象: ${name} -> ${used}`)
-  }
-  traverse(ast, {
-    VariableDeclarator: deleteObject,
   })
   return ast
 }
@@ -127,7 +110,7 @@ function stringArrayV2(ast) {
     // >= 2.10.0
     const fp1 = `(){try{if()break${arr}push(${arr}shift())}catch(){${arr}push(${arr}shift())}}`
     // < 2.10.0
-    const fp2 = `const=function(){while(--){${arr}push(${arr}shift)}}${cmpV}`
+    const fp2 = `=function(){while(--){${arr}push(${arr}shift)}}${cmpV}`
     const code = '' + callee.get('body')
     if (!checkPattern(code, fp1) && !checkPattern(code, fp2)) {
       return
@@ -211,7 +194,7 @@ function stringArrayV3(ast) {
   let ob_func_str = []
   let ob_dec_name = []
   let ob_string_func_name = null
-  // **Prefer** Find the string list func ("func1") by matching its feature:
+  // Normally, the string array func ("func1") follows the template below:
   // function aaa() {
   //   const bbb = [...]
   //   aaa = function () {
@@ -219,6 +202,7 @@ function stringArrayV3(ast) {
   //   };
   //   return aaa();
   // }
+  // In some cases (lint), the assignment is merged into the ReturnStatement
   // After finding the possible func1, this method will check all the binding
   // references and put the child encode function into list.
   function find_string_array_function(path) {
@@ -228,29 +212,33 @@ function stringArrayV3(ast) {
     if (
       !t.isIdentifier(path.node.id) ||
       path.node.params.length ||
-      !t.isBlockStatement(path.node.body) ||
-      path.node.body.body.length != 3
+      !t.isBlockStatement(path.node.body)
     ) {
+      return
+    }
+    const body = path.node.body.body
+    if (body.length < 2 || body.length > 3) {
       return
     }
     const name_func = path.node.id.name
     let string_var = -1
-    const body = path.node.body.body
     try {
       if (
         body[0].declarations.length != 1 ||
         !(string_var = body[0].declarations[0].id.name) ||
-        !t.isArrayExpression(body[0].declarations[0].init) ||
-        name_func != body[1].expression.left.name ||
-        body[1].expression.right.params.length ||
-        string_var != body[1].expression.right.body.body[0].argument.name ||
-        body[2].argument.arguments.length ||
-        name_func != body[2].argument.callee.name
+        !t.isArrayExpression(body[0].declarations[0].init)
       ) {
         return
       }
+      const nodes = [...body]
+      nodes.shift()
+      const code = generator(t.BlockStatement(nodes)).code
+      const fp = `${name_func}=function(){return${string_var}}${name_func}()`
+      if (!checkPattern(code, fp)) {
+        return
+      }
     } catch {
-      //
+      return
     }
     const binding = path.scope.getBinding(name_func)
     if (!binding.referencePaths) {
@@ -389,22 +377,33 @@ function decodeGlobal(ast) {
       }
     }
   }
-  function do_collect_func(path) {
+  function do_collect_func_dec(path) {
     // function A (...) { return function B (...) }
+    do_collect_func(path, path)
+  }
+  function do_collect_func_var(path) {
+    // var A = function (...) { return function B (...) }
+    let func_path = path.get('init')
+    if (!func_path.isFunctionExpression()) {
+      return
+    }
+    do_collect_func(path, func_path)
+  }
+  function do_collect_func(root, path) {
     if (
       path.node.body.body.length == 1 &&
       path.node.body.body[0].type == 'ReturnStatement' &&
       path.node.body.body[0].argument?.type == 'CallExpression' &&
       path.node.body.body[0].argument.callee.type == 'Identifier' &&
       // path.node.params.length == 5 &&
-      path.node.id
+      root.node.id
     ) {
       let call_func = path.node.body.body[0].argument.callee.name
       if (exist_names.indexOf(call_func) == -1) {
         return
       }
-      let name = path.node.id.name
-      let t = generator(path.node, { minified: true }).code
+      let name = root.node.id.name
+      let t = generator(root.node, { minified: true }).code
       if (collect_names.indexOf(name) == -1) {
         collect_codes.push(t)
         collect_names.push(name)
@@ -444,7 +443,8 @@ function decodeGlobal(ast) {
     // 收集所有调用已收集混淆函数的混淆函数
     collect_codes = []
     collect_names = []
-    traverse(ast, { FunctionDeclaration: do_collect_func })
+    traverse(ast, { FunctionDeclaration: do_collect_func_dec })
+    traverse(ast, { VariableDeclarator: do_collect_func_var })
     traverse(ast, { VariableDeclarator: do_collect_var })
     traverse(ast, { AssignmentExpression: do_collect_var })
     exist_names = collect_names
@@ -483,6 +483,7 @@ function stringArrayLite(ast) {
         if (
           !ref.parentPath.isMemberExpression() ||
           ref.key !== 'object' ||
+          ref.parentPath.key == 'left' ||
           !t.isNumericLiteral(ref.parent.property)
         ) {
           return
@@ -541,7 +542,7 @@ function mergeObject(path) {
   let name = id.name
   let scope = path.scope
   let binding = scope.getBinding(name)
-  if (!binding || binding.kind !== 'const') {
+  if (!binding || !binding.constant) {
     // 确认该对象没有被多次定义
     return
   }
@@ -637,7 +638,7 @@ function mergeObject(path) {
       continue
     }
     let child = up1.node.id.name
-    if (!up1.scope.bindings[child].constant) {
+    if (!up1.scope.bindings[child]?.constant) {
       continue
     }
     up1.scope.rename(child, name, up1.scope.block)
@@ -1200,6 +1201,8 @@ const deleteSelfDefendingCode = {
       `return${selfName}.toString().search().toString().constructor(${selfName}).search()`,
       // @7135b09
       `const=function(){const=.constructor()return.test(${selfName})}return()`,
+      // #94
+      `var=function(){var=.constructor()return.test(${selfName})}return()`,
     ]
     let valid = false
     for (let pattern of patterns) {
@@ -1280,15 +1283,21 @@ const deleteDebugProtectionCode = {
         rm.remove()
         continue
       }
-      // DebugProtectionFunctionCall
-      const up2 = up1.getFunctionParent().parentPath
-      const scope2 = up2.scope.getBinding(callName).scope
-      up2.remove()
-      scope1.crawl()
-      scope2.crawl()
-      const bind = scope2.bindings[callName]
-      bind.path.remove()
-      console.info(`Remove CallFunc: ${callName}`)
+      const up2 = up1.getFunctionParent()?.parentPath
+      if (up2) {
+        // DebugProtectionFunctionCall
+        const scope2 = up2.scope.getBinding(callName).scope
+        up2.remove()
+        scope1.crawl()
+        scope2.crawl()
+        const bind = scope2.bindings[callName]
+        bind.path.remove()
+        console.info(`Remove CallFunc: ${callName}`)
+        continue
+      }
+      // exceptions #95
+      const rm = ref.parentPath
+      rm.remove()
     }
     path.remove()
     console.info(`Remove DebugProtectionFunc: ${debugName}`)
@@ -1347,10 +1356,16 @@ function unlockEnv(ast) {
   return ast
 }
 
-module.exports = function (jscode) {
+module.exports = function (code) {
+  let ret = PluginEval.unpack(code)
+  let global_eval = false
+  if (ret) {
+    global_eval = true
+    code = ret
+  }
   let ast
   try {
-    ast = parse(jscode, { errorRecovery: true })
+    ast = parse(code, { errorRecovery: true })
   } catch (e) {
     console.error(`Cannot parse code: ${e.reasonCode}`)
     return null
@@ -1395,9 +1410,12 @@ module.exports = function (jscode) {
   console.log('解除环境限制...')
   ast = unlockEnv(ast)
   console.log('净化完成')
-  let { code } = generator(ast, {
+  code = generator(ast, {
     comments: false,
     jsescOption: { minimal: true },
-  })
+  }).code
+  if (global_eval) {
+    code = PluginEval.pack(code)
+  }
   return code
 }
